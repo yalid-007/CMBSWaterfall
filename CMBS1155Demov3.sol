@@ -10,7 +10,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  * @title CMBS1155 Waterfall Demo
  * @notice Extends CMBS1155 to include batch investor distribution and demo functions
  */
-contract CMBS1155Demo is ERC1155Supply, AccessControl, Pausable {
+contract CMBS1155 is ERC1155Supply, AccessControl, Pausable {
     // --- DEMO ONLY: fast-forward time by an offset ---
     /**
      * @dev Advances `lastAccrual` by `secondsDelta`. Only for demo/testing.
@@ -46,6 +46,8 @@ contract CMBS1155Demo is ERC1155Supply, AccessControl, Pausable {
     event PaymentAllocated(uint256 indexed id, uint256 interestPaid, uint256 principalPaid);
     event Distribution(uint256 indexed id, address indexed investor, uint256 amount);
     event Withdraw(address indexed investor, uint256 indexed id, uint256 amount);
+    event TrancheSnapshot(uint256 indexed id, uint256 principal, uint256 accruedInterest, uint256 cashAvailable, uint256 seniority);
+    event WaterfallComplete(uint256 totalPaid);
 
     constructor(IERC20 _stable, string memory _uri) ERC1155(_uri) {
         stable = _stable;
@@ -125,35 +127,76 @@ contract CMBS1155Demo is ERC1155Supply, AccessControl, Pausable {
     //  WATERFALL & PAYMENT DISTRIBUTION
     // ------------------------------------------------------
 
-    function depositAndDistribute(uint256 amount)
-        external
-        whenNotPaused
-        onlyRole(SERVICER_ROLE)
-    {
-        require(stable.transferFrom(msg.sender, address(this), amount), "TRANSFER_FAILED");
-        _accrueAllInterest();
+    // ───────────────────────────────── WATERFALL ─────────────────────────────
+/**
+ * @notice Servicer deposits `amount` of stable-coin, interest first then principal
+ *         down the waterfall.  
+ *         ① Emits a snapshot of every tranche *before* the run.  
+ *         ② Emits the exact interest & principal paid per tranche.  
+ *         ③ Asserts (and logs) that the total paid == `amount`.
+ */
+function depositAndDistribute(uint256 amount)
+    external
+    whenNotPaused
+    onlyRole(SERVICER_ROLE)
+{
+    require(amount > 0, "ZERO_AMOUNT");
+    require(stable.transferFrom(msg.sender, address(this), amount), "TRANSFER_FAILED");
 
-        uint256 remaining = amount;
-        for (uint8 s = 0; s < 255 && remaining > 0; ++s) {
+    _accrueAllInterest();  // pull interest up-to-date first
+
+    /* ①  Log the starting state of every tranche */
+    for (uint256 id = 0; id < nextTrancheId; ++id) {
+        Tranche storage t = tranches[id];
+        emit TrancheSnapshot(
+            id,
+            t.principal,
+            t.accruedInterest,
+            t.cashAvailable,
+            t.seniority
+        );
+    }
+
+    uint256 remaining           = amount;
+    uint256 totalInterestPaid   = 0;
+    uint256 totalPrincipalPaid  = 0;
+
+    /* ②  Classic two-layer waterfall: interest first, then principal, senior-to-junior */
+    for (uint8 s = 0; s < 255 && remaining > 0; ++s) {
+        for (uint8 pass = 0; pass < 2 && remaining > 0; ++pass) { // 0 = interest, 1 = principal
             for (uint256 id = 0; id < nextTrancheId && remaining > 0; ++id) {
                 Tranche storage t = tranches[id];
                 if (t.seniority != s) continue;
 
-                uint256 payInt = t.accruedInterest <= remaining ? t.accruedInterest : remaining;
-                t.accruedInterest -= payInt;
-                t.cashAvailable  += payInt;
-                remaining        -= payInt;
+                uint256 need = pass == 0 ? t.accruedInterest : t.principal;
+                if (need == 0) continue;
 
-                uint256 payPrin = t.principal <= remaining ? t.principal : remaining;
-                t.principal     -= payPrin;
-                t.cashAvailable += payPrin;
-                remaining       -= payPrin;
+                uint256 pay = need > remaining ? remaining : need;
 
-                emit PaymentAllocated(id, payInt, payPrin);
+                if (pass == 0) {
+                    t.accruedInterest -= pay;
+                    totalInterestPaid += pay;
+                } else {
+                    t.principal       -= pay;
+                    totalPrincipalPaid += pay;
+                }
+                t.cashAvailable     += pay;
+                remaining           -= pay;
+
+                emit PaymentAllocated(
+                    id,
+                    pass == 0 ? pay : 0,
+                    pass == 1 ? pay : 0
+                );
             }
         }
-        emit PaymentAllocated(type(uint256).max, 0, remaining);
     }
+
+    /* ③  Ensure every wei was allocated and log the summary */
+    require(totalInterestPaid + totalPrincipalPaid == amount, "SUM_MISMATCH");
+    emit WaterfallComplete(totalInterestPaid + totalPrincipalPaid);
+}
+
 
     // ------------------------------------------------------
     //  INVESTOR WITHDRAWALS
